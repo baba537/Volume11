@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Version from the tag
+        id: version
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { $version = '0.0.0' }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Version: $version"
+
+      - name: Build
+        run: cargo build --release
+
+      # A single self-contained file is the whole point of the rewrite, so the
+      # build is checked for stray DLLs before anything is published.
+      - name: Verify the executable stands alone
+        shell: pwsh
+        run: |
+          $exe = "target/release/volume11.exe"
+          if (-not (Test-Path $exe)) { throw "executable missing" }
+          $size = (Get-Item $exe).Length / 1MB
+          Write-Host ("Size: {0:N1} MB" -f $size)
+          if ($size -gt 20) { throw "executable unexpectedly large: $size MB" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $exe dist/Volume11.exe
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc "/DAppVersion=${{ steps.version.outputs.version }}" installer\volume11.iss
+          if ($LASTEXITCODE -ne 0) { throw "installer build failed" }
+          Get-ChildItem dist | ForEach-Object { "{0,-24} {1,8:N2} MB" -f $_.Name, ($_.Length/1MB) }
+
+      # Only this version's section, so the notes do not repeat the whole
+      # project history.
+      - name: Release notes for this version
+        shell: pwsh
+        run: |
+          $lines = Get-Content CHANGELOG.md
+          $match = $lines | Select-String -Pattern "^## ${{ steps.version.outputs.version }}" | Select-Object -First 1
+          if (-not $match) { "" | Set-Content notes.md -Encoding utf8; exit 0 }
+          $rest = $lines[$match.LineNumber..($lines.Count - 1)]
+          $next = $rest | Select-String -Pattern "^## " | Select-Object -First 1
+          if ($next) { $rest = $rest[0..($next.LineNumber - 2)] }
+          $rest | Set-Content notes.md -Encoding utf8
+          Get-Content notes.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Volume11-Setup.exe
+            dist/Volume11.exe
+          body_path: notes.md
+          draft: false

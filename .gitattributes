@@ -1,0 +1,10 @@
+# Normalise line endings in the repository; check out native on Windows.
+* text=auto
+
+*.rs   text eol=lf
+*.toml text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+
+*.ico binary
+*.png binary
