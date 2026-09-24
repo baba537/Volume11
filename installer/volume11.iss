@@ -4,7 +4,7 @@
 ; matches an application whose autostart entry and settings are per-user
 ; anyway. Running the setup elevated installs to Program Files instead.
 ;
-; Build:  ISCC.exe /DAppVersion=0.1.6 installer\volume11.iss
+; Build:  ISCC.exe /DAppVersion=0.2.0 installer\volume11.iss
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -97,6 +97,29 @@ function InitializeUninstall(): Boolean;
 begin
   AskRunningInstanceToQuit();
   Result := True;
+end;
+
+{ An autostart entry written by an earlier copy - a downloaded executable, a
+  portable folder - keeps pointing there after this install. If that file is
+  later deleted, Windows starts nothing while the settings still say autostart
+  is on. The entry is repointed here; the Task Manager status byte is left as
+  it is, so a disabled entry stays disabled. The application does the same on
+  every start, but a silent update never starts it. }
+procedure AdoptAutostartEntry();
+var
+  Existing: String;
+begin
+  if RegQueryStringValue(HKEY_CURRENT_USER,
+       'Software\Microsoft\Windows\CurrentVersion\Run', 'Volume11', Existing) then
+    RegWriteStringValue(HKEY_CURRENT_USER,
+      'Software\Microsoft\Windows\CurrentVersion\Run', 'Volume11',
+      '"' + ExpandConstant('{app}\{#AppExe}') + '"');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    AdoptAutostartEntry();
 end;
 
 { Autostart is owned by the application, not by this installer: it writes the

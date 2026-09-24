@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Bumped only when the on-disk shape changes incompatibly.
-const CURRENT_VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 2;
 
 /// What happens to an application that starts playing and has no saved entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -64,13 +64,34 @@ impl Default for Settings {
     }
 }
 
+/// Saved levels for one playback device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DeviceEntry {
+    /// Name the device had when last seen, so the file stays readable and the
+    /// entry can be recognised while the device is unplugged.
+    pub label: String,
+    /// Keyed by lower-cased executable name (`firefox.exe`) or `@master` / `@system`.
+    pub apps: BTreeMap<String, AppEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub version: u32,
     pub settings: Settings,
-    /// Keyed by lower-cased executable name (`firefox.exe`) or `@master` / `@system`.
-    /// A `BTreeMap` keeps the file diff-friendly across saves.
+    /// One set of saved levels per playback device, keyed by endpoint id.
+    ///
+    /// A program is usually wanted at a different level on speakers than on a
+    /// headset, and Windows itself keeps per-application volume per device, so
+    /// storing one level per program across all devices would fight Windows
+    /// every time the output changed. `BTreeMap` keeps the file diff-friendly.
+    pub devices: BTreeMap<String, DeviceEntry>,
+    /// Version 1 stored a single set of levels here. They belong to whichever
+    /// device was in use back then, which is not known until the audio engine
+    /// reports the current one, so they wait here until `adopt_legacy` moves
+    /// them. Never written back once empty.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub apps: BTreeMap<String, AppEntry>,
 }
 
@@ -79,18 +100,34 @@ impl Default for Config {
         Self {
             version: CURRENT_VERSION,
             settings: Settings::default(),
+            devices: BTreeMap::new(),
             apps: BTreeMap::new(),
         }
     }
 }
 
 impl Config {
-    pub fn get(&self, key: &str) -> Option<&AppEntry> {
-        self.apps.get(key)
+    /// Saved levels for one device, if it has any.
+    pub fn device(&self, device: &str) -> Option<&DeviceEntry> {
+        self.devices.get(device)
     }
 
-    pub fn set(&mut self, key: &str, volume: u8, muted: bool, label: &str) {
-        self.apps.insert(
+    pub fn get(&self, device: &str, key: &str) -> Option<&AppEntry> {
+        self.devices.get(device)?.apps.get(key)
+    }
+
+    pub fn set(
+        &mut self,
+        device: &str,
+        device_label: &str,
+        key: &str,
+        volume: u8,
+        muted: bool,
+        label: &str,
+    ) {
+        let entry = self.devices.entry(device.to_string()).or_default();
+        entry.label = device_label.to_string();
+        entry.apps.insert(
             key.to_string(),
             AppEntry {
                 volume: volume.min(100),
@@ -100,16 +137,52 @@ impl Config {
         );
     }
 
-    pub fn remove(&mut self, key: &str) {
-        self.apps.remove(key);
+    pub fn remove(&mut self, device: &str, key: &str) {
+        if let Some(entry) = self.devices.get_mut(device) {
+            entry.apps.remove(key);
+            if entry.apps.is_empty() {
+                self.devices.remove(device);
+            }
+        }
     }
 
-    /// Everything saved, in the shape the audio engine expects for `ApplyAll`.
-    pub fn as_apply_list(&self) -> Vec<(String, u8, bool)> {
-        self.apps
-            .iter()
-            .map(|(key, entry)| (key.clone(), entry.volume, entry.muted))
-            .collect()
+    /// Everything saved for one device, in the shape `ApplyAll` expects.
+    pub fn apply_list(&self, device: &str) -> Vec<(String, u8, bool)> {
+        self.devices
+            .get(device)
+            .map(|entry| {
+                entry
+                    .apps
+                    .iter()
+                    .map(|(key, app)| (key.clone(), app.volume, app.muted))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Attach levels saved by version 1 to the device in use now.
+    ///
+    /// Version 1 kept one set of levels for whatever device was the default,
+    /// so the default at the first start after upgrading is the best available
+    /// guess. Entries already saved for that device win over legacy ones.
+    /// Returns whether anything moved, so the caller knows to save.
+    pub fn adopt_legacy(&mut self, device: &str, device_label: &str) -> bool {
+        if self.apps.is_empty() || device.is_empty() {
+            return false;
+        }
+
+        let legacy = std::mem::take(&mut self.apps);
+        let entry = self.devices.entry(device.to_string()).or_default();
+
+        if entry.label.is_empty() {
+            entry.label = device_label.to_string();
+        }
+        for (key, app) in legacy {
+            entry.apps.entry(key).or_insert(app);
+        }
+
+        self.version = CURRENT_VERSION;
+        true
     }
 
     pub fn load(path: &Path) -> Self {
@@ -177,17 +250,80 @@ pub fn config_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    const SPEAKERS: &str = "{0.0.0.00000000}.{speakers}";
+    const HEADSET: &str = "{0.0.0.00000000}.{headset}";
+
+    #[test]
+    fn devices_keep_separate_levels() {
+        let mut config = Config::default();
+        config.set(SPEAKERS, "Speakers", "spotify.exe", 80, false, "Spotify");
+        config.set(HEADSET, "Headset", "spotify.exe", 30, false, "Spotify");
+
+        assert_eq!(config.get(SPEAKERS, "spotify.exe").unwrap().volume, 80);
+        assert_eq!(config.get(HEADSET, "spotify.exe").unwrap().volume, 30);
+        assert_eq!(
+            config.apply_list(HEADSET),
+            vec![("spotify.exe".into(), 30, false)]
+        );
+        assert!(config.apply_list("{unknown}").is_empty());
+    }
+
+    #[test]
+    fn removing_the_last_entry_drops_the_device() {
+        let mut config = Config::default();
+        config.set(SPEAKERS, "Speakers", "vlc.exe", 30, false, "VLC");
+        config.remove(SPEAKERS, "vlc.exe");
+        assert!(config.device(SPEAKERS).is_none());
+    }
+
+    #[test]
+    fn version_one_levels_move_to_the_current_device() {
+        let v1 = r#"{"version":1,"settings":{},"apps":{
+            "spotify.exe":{"volume":45,"muted":false,"label":"Spotify"}}}"#;
+        let mut config: Config = serde_json::from_str(v1).unwrap();
+
+        assert!(config.adopt_legacy(HEADSET, "Headset"));
+        assert_eq!(config.get(HEADSET, "spotify.exe").unwrap().volume, 45);
+        assert!(config.apps.is_empty());
+        assert_eq!(config.version, CURRENT_VERSION);
+
+        // Nothing left to move the second time.
+        assert!(!config.adopt_legacy(SPEAKERS, "Speakers"));
+
+        // The top-level legacy field is not written back once empty; `apps`
+        // still exists inside each device entry, so check the structure.
+        let value: serde_json::Value = serde_json::to_value(&config).unwrap();
+        assert!(value.get("apps").is_none(), "stray legacy map: {value}");
+    }
+
+    #[test]
+    fn legacy_levels_do_not_overwrite_newer_ones() {
+        let mut config = Config::default();
+        config.set(HEADSET, "Headset", "spotify.exe", 70, false, "Spotify");
+        config.apps.insert(
+            "spotify.exe".into(),
+            AppEntry {
+                volume: 10,
+                muted: true,
+                label: "Spotify".into(),
+            },
+        );
+
+        config.adopt_legacy(HEADSET, "Headset");
+        assert_eq!(config.get(HEADSET, "spotify.exe").unwrap().volume, 70);
+    }
+
     #[test]
     fn round_trips_through_json() {
         let mut config = Config::default();
-        config.set("firefox.exe", 42, true, "Firefox");
+        config.set(SPEAKERS, "Speakers", "firefox.exe", 42, true, "Firefox");
         config.settings.always_on_top = true;
 
         let text = serde_json::to_string(&config).unwrap();
         let parsed: Config = serde_json::from_str(&text).unwrap();
 
         assert_eq!(parsed, config);
-        assert_eq!(parsed.get("firefox.exe").unwrap().volume, 42);
+        assert_eq!(parsed.get(SPEAKERS, "firefox.exe").unwrap().volume, 42);
     }
 
     #[test]
@@ -227,8 +363,8 @@ mod tests {
     #[test]
     fn volume_is_clamped_on_write() {
         let mut config = Config::default();
-        config.set("x.exe", 250, false, "X");
-        assert_eq!(config.get("x.exe").unwrap().volume, 100);
+        config.set(SPEAKERS, "Speakers", "x.exe", 250, false, "X");
+        assert_eq!(config.get(SPEAKERS, "x.exe").unwrap().volume, 100);
     }
 
     #[test]
@@ -237,7 +373,7 @@ mod tests {
         let path = dir.join("config.json");
 
         let mut config = Config::default();
-        config.set("vlc.exe", 30, false, "VLC");
+        config.set(SPEAKERS, "Speakers", "vlc.exe", 30, false, "VLC");
         config.save(&path).unwrap();
 
         let loaded = Config::load(&path);

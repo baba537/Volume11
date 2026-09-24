@@ -272,3 +272,129 @@ pub fn number_field(
         .ok()
         .map(|parsed| parsed.min(100) as u8)
 }
+
+/// The current output device, as a row that unfolds the device list.
+///
+/// Drawn as one wide target with a chevron on the right, so it reads as
+/// something to click rather than a caption. Only offered as a control when
+/// there is more than one device to choose from.
+pub fn device_selector(
+    ui: &mut Ui,
+    name: &str,
+    open: bool,
+    switchable: bool,
+    palette: &Palette,
+) -> Response {
+    let width = ui.available_width();
+    let height = 26.0;
+    let sense = if switchable {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), sense);
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+
+        if switchable && (response.hovered() || open) {
+            painter.rect_filled(rect, ROW_CORNER, palette.surface_hover);
+        }
+
+        let chevron_space = if switchable { 22.0 } else { 0.0 };
+        let text_rect = Rect::from_min_max(
+            pos2(rect.left() + 6.0, rect.top()),
+            pos2(rect.right() - chevron_space, rect.bottom()),
+        );
+
+        let colour = if switchable && response.hovered() {
+            palette.text
+        } else {
+            palette.text_dim
+        };
+
+        let galley = painter.layout(
+            name.to_string(),
+            FontId::proportional(12.5),
+            colour,
+            f32::INFINITY,
+        );
+
+        // Clip rather than wrap: a long device name must stay on one line.
+        painter.with_clip_rect(text_rect).galley(
+            pos2(text_rect.left(), rect.center().y - galley.size().y / 2.0),
+            galley,
+            colour,
+        );
+
+        if switchable {
+            let centre = pos2(rect.right() - 12.0, rect.center().y);
+            let size = 4.0;
+            // Points down when folded, up when the list is open.
+            let points = if open {
+                vec![
+                    pos2(centre.x - size, centre.y + size / 2.0),
+                    pos2(centre.x + size, centre.y + size / 2.0),
+                    pos2(centre.x, centre.y - size / 2.0),
+                ]
+            } else {
+                vec![
+                    pos2(centre.x - size, centre.y - size / 2.0),
+                    pos2(centre.x + size, centre.y - size / 2.0),
+                    pos2(centre.x, centre.y + size / 2.0),
+                ]
+            };
+            painter.add(egui::Shape::convex_polygon(points, colour, Stroke::NONE));
+        }
+    }
+
+    response
+}
+
+/// One entry in the unfolded device list.
+pub fn device_option(ui: &mut Ui, name: &str, current: bool, palette: &Palette) -> Response {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+
+        if current {
+            painter.rect_filled(rect, ROW_CORNER, palette.accent.gamma_multiply(0.16));
+        } else if response.hovered() {
+            painter.rect_filled(rect, ROW_CORNER, palette.surface_hover);
+        }
+
+        // A dot marks the device in use, so the list works without colour too.
+        if current {
+            painter.circle_filled(
+                pos2(rect.left() + 14.0, rect.center().y),
+                3.5,
+                palette.accent,
+            );
+        }
+
+        let text_rect = Rect::from_min_max(
+            pos2(rect.left() + 26.0, rect.top()),
+            pos2(rect.right() - 8.0, rect.bottom()),
+        );
+        let colour = if current {
+            palette.accent
+        } else {
+            palette.text
+        };
+        let galley = painter.layout(
+            name.to_string(),
+            FontId::proportional(14.0),
+            colour,
+            f32::INFINITY,
+        );
+        painter.with_clip_rect(text_rect).galley(
+            pos2(text_rect.left(), rect.center().y - galley.size().y / 2.0),
+            galley,
+            colour,
+        );
+    }
+
+    response.on_hover_text(name)
+}

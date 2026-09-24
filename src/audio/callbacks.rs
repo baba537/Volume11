@@ -41,6 +41,8 @@ pub enum Notification {
     },
     /// The default playback device changed.
     DefaultDeviceChanged,
+    /// A device was added, removed, enabled or disabled.
+    DevicesChanged,
 }
 
 /// `IAudioSessionNotification` — fires when any process opens a new audio stream.
@@ -170,15 +172,20 @@ impl IMMNotificationClient_Impl for DeviceNotification_Impl {
         Ok(())
     }
 
+    // Plugging headphones in or out, or enabling a device in the Sound panel,
+    // changes what can be switched to.
     fn OnDeviceStateChanged(&self, _device_id: &PCWSTR, _new_state: DEVICE_STATE) -> Result<()> {
+        let _ = self.tx.send(Notification::DevicesChanged);
         Ok(())
     }
 
     fn OnDeviceAdded(&self, _device_id: &PCWSTR) -> Result<()> {
+        let _ = self.tx.send(Notification::DevicesChanged);
         Ok(())
     }
 
     fn OnDeviceRemoved(&self, _device_id: &PCWSTR) -> Result<()> {
+        let _ = self.tx.send(Notification::DevicesChanged);
         Ok(())
     }
 

@@ -11,9 +11,9 @@ use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::S_OK;
 use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioEndpointVolumeCallback};
 use windows::Win32::Media::Audio::{
-    IAudioSessionControl, IAudioSessionControl2, IAudioSessionEvents, IAudioSessionManager2,
-    IAudioSessionNotification, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
-    ISimpleAudioVolume, MMDeviceEnumerator, eMultimedia, eRender,
+    DEVICE_STATE_ACTIVE, IAudioSessionControl, IAudioSessionControl2, IAudioSessionEvents,
+    IAudioSessionManager2, IAudioSessionNotification, IMMDevice, IMMDeviceEnumerator,
+    IMMNotificationClient, ISimpleAudioVolume, MMDeviceEnumerator, eMultimedia, eRender,
 };
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
@@ -24,12 +24,13 @@ use windows::core::{GUID, Interface};
 use super::callbacks::{
     DeviceNotification, EndpointVolumeCallback, Notification, SessionEvents, SessionNotification,
 };
+use super::policy::set_default_device;
 use super::process::{
     executable_name, executable_path, file_description, friendly_label, usable_display_name,
 };
 use super::{
-    Command, Event, MASTER_KEY, SYSTEM_KEY, SessionKind, SessionSnapshot, percent_to_scalar,
-    scalar_to_percent,
+    Command, DeviceInfo, Event, MASTER_KEY, SYSTEM_KEY, SessionKind, SessionSnapshot,
+    percent_to_scalar, scalar_to_percent,
 };
 
 /// Passed as the event context on every write this app makes, so the resulting
@@ -226,6 +227,7 @@ impl Engine {
     }
 
     fn run<F: Fn()>(&mut self, commands: &Receiver<Command>, wake: &F) {
+        self.publish_devices(wake);
         self.publish_sessions(wake);
 
         loop {
@@ -257,6 +259,17 @@ impl Engine {
             Command::Refresh => {
                 let _ = self.rebuild_sessions();
                 self.publish_sessions(wake);
+            }
+            Command::SetDefaultDevice(id) => {
+                // Success needs no reply here: Windows answers with
+                // OnDefaultDeviceChanged, which runs the same switch as a
+                // change made anywhere else.
+                if let Err(error) = set_default_device(&id) {
+                    let _ = self
+                        .events
+                        .send(Event::Fatal(format!("Could not switch device: {error}")));
+                    wake();
+                }
             }
             Command::Shutdown => {}
         }
@@ -349,6 +362,10 @@ impl Engine {
             }
             Notification::DefaultDeviceChanged => {
                 self.switch_device(wake);
+                self.publish_devices(wake);
+            }
+            Notification::DevicesChanged => {
+                self.publish_devices(wake);
             }
         }
     }
@@ -383,7 +400,8 @@ impl Engine {
                 let _ = self.rebuild_sessions();
 
                 let name = self.device_name();
-                let _ = self.events.send(Event::DeviceChanged(name));
+                let id = device_id(&self.device).unwrap_or_default();
+                let _ = self.events.send(Event::DeviceChanged { id, name });
                 self.publish_sessions(wake);
             }
             Err(error) => {
@@ -396,15 +414,39 @@ impl Engine {
     }
 
     fn device_name(&self) -> String {
+        friendly_name(&self.device)
+    }
+
+    /// Every active playback device, plus the id of the current default.
+    fn publish_devices<F: Fn()>(&self, wake: &F) {
+        let mut list = Vec::new();
+
         unsafe {
-            let Ok(store) = self.device.OpenPropertyStore(STGM_READ) else {
-                return "Unknown".into();
-            };
-            let Ok(value) = store.GetValue(&PKEY_Device_FriendlyName) else {
-                return "Unknown".into();
-            };
-            value.to_string()
+            if let Ok(collection) = self
+                .enumerator
+                .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
+                && let Ok(count) = collection.GetCount()
+            {
+                for index in 0..count {
+                    let Ok(device) = collection.Item(index) else {
+                        continue;
+                    };
+                    let Some(id) = device_id(&device) else {
+                        continue;
+                    };
+                    list.push(DeviceInfo {
+                        id,
+                        name: friendly_name(&device),
+                    });
+                }
+            }
         }
+
+        list.sort_by_key(|device| device.name.to_lowercase());
+
+        let current = device_id(&self.device).unwrap_or_default();
+        let _ = self.events.send(Event::Devices { list, current });
+        wake();
     }
 
     /// Full re-enumeration. Only runs on structural changes, never while dragging.
@@ -595,4 +637,22 @@ fn take_pwstr(raw: windows::core::PWSTR) -> Option<String> {
     }
 
     text
+}
+
+/// Endpoint id of a device, e.g. `{0.0.0.00000000}.{8a0e…}`.
+fn device_id(device: &IMMDevice) -> Option<String> {
+    unsafe { device.GetId() }.ok().and_then(take_pwstr)
+}
+
+/// Name as shown in the Windows sound settings.
+fn friendly_name(device: &IMMDevice) -> String {
+    unsafe {
+        let Ok(store) = device.OpenPropertyStore(STGM_READ) else {
+            return "Unknown".into();
+        };
+        let Ok(value) = store.GetValue(&PKEY_Device_FriendlyName) else {
+            return "Unknown".into();
+        };
+        value.to_string()
+    }
 }

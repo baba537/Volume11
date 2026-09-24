@@ -31,7 +31,14 @@ fn main() {
             Ok(audio::Event::Changed { key, volume, muted }) => {
                 println!("  ~ external change: {key} -> {volume} muted={muted}");
             }
-            Ok(audio::Event::DeviceChanged(name)) => println!("  ~ device now: {name}"),
+            Ok(audio::Event::DeviceChanged { name, .. }) => println!("  ~ device now: {name}"),
+            Ok(audio::Event::Devices { list, current }) => {
+                println!("--- {} playback devices ---", list.len());
+                for d in &list {
+                    let mark = if d.id == current { "*" } else { " " };
+                    println!("  {mark} {}  [{}]", d.name, d.id);
+                }
+            }
             Ok(audio::Event::SessionAdded { key, .. }) => println!("  ~ new session: {key}"),
             Ok(audio::Event::Fatal(msg)) => {
                 println!("FATAL: {msg}");

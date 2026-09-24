@@ -149,6 +149,84 @@ pub fn remove() -> Result<(), String> {
     Ok(())
 }
 
+/// The command currently stored under `Run`, if any.
+fn run_command() -> Option<String> {
+    let key = open(RUN_KEY, KEY_READ)?;
+
+    // Ask for the size first; a path can be longer than any fixed buffer.
+    let mut length: u32 = 0;
+    let sized = unsafe { RegQueryValueExW(key, VALUE_NAME, None, None, None, Some(&mut length)) };
+
+    if sized.is_err() || length == 0 {
+        close(key);
+        return None;
+    }
+
+    let mut buffer = vec![0u16; (length as usize).div_ceil(2)];
+    let read = unsafe {
+        RegQueryValueExW(
+            key,
+            VALUE_NAME,
+            None,
+            None,
+            Some(buffer.as_mut_ptr() as *mut u8),
+            Some(&mut length),
+        )
+    };
+    close(key);
+
+    if read.is_err() {
+        return None;
+    }
+
+    let text = String::from_utf16_lossy(&buffer);
+    Some(text.trim_end_matches('\0').to_string())
+}
+
+/// Path of the executable a `Run` command starts, without quotes or arguments.
+fn command_target(command: &str) -> &str {
+    let command = command.trim();
+
+    if let Some(rest) = command.strip_prefix('"') {
+        rest.split('"').next().unwrap_or(rest)
+    } else {
+        command.split(' ').next().unwrap_or(command)
+    }
+}
+
+/// Point a dead autostart entry at this executable.
+///
+/// The entry is written with the path of whichever copy switched it on. Once
+/// that copy is deleted — a download replaced by the installed version, a
+/// portable folder removed — Windows starts a file that is no longer there,
+/// while the settings panel still reports autostart as on.
+///
+/// Only a *missing* target is replaced. Repointing whenever the running copy
+/// differs would let any copy that is merely started once — a portable one on a
+/// stick, a build being tested — take over a working entry. An old copy that
+/// still exists next to a new install is handled by the installer, which
+/// adopts the entry when it runs. The Task Manager status byte is left alone,
+/// so a disabled entry stays disabled.
+///
+/// Returns whether the command was changed.
+pub fn repair() -> bool {
+    let Some(command) = run_command() else {
+        return false;
+    };
+
+    let target = command_target(&command);
+    if !needs_repair(target, std::path::Path::new(target).exists()) {
+        return false;
+    }
+
+    write_run_command().is_ok()
+}
+
+/// Whether an entry pointing at `target` should be rewritten.
+fn needs_repair(target: &str, target_exists: bool) -> bool {
+    !target.trim().is_empty() && !target_exists
+}
+
 /// Whether the `Run` value exists at all, regardless of its status byte.
 fn run_command_exists() -> bool {
     let Some(key) = open(RUN_KEY, KEY_READ) else {
@@ -210,6 +288,32 @@ mod tests {
         // from the meaning documented above.
         assert_eq!(STATUS_ENABLED & 1, 0, "0x02 must read as enabled");
         assert_eq!(STATUS_DISABLED & 1, 1, "0x03 must read as disabled");
+    }
+
+    #[test]
+    fn command_target_handles_quotes_and_arguments() {
+        assert_eq!(
+            command_target(r#""C:\Program Files\Volume11\Volume11.exe""#),
+            r"C:\Program Files\Volume11\Volume11.exe"
+        );
+        assert_eq!(
+            command_target(r#""C: b\Volume11.exe" --show"#),
+            r"C: b\Volume11.exe"
+        );
+        assert_eq!(
+            command_target(r"C:\Tools\Volume11.exe --show"),
+            r"C:\Tools\Volume11.exe"
+        );
+    }
+
+    #[test]
+    fn only_a_missing_target_is_repaired() {
+        // Dead entry, e.g. a deleted download: repoint.
+        assert!(needs_repair(r"C:\Users\x\Downloads\Volume11.exe", false));
+        // Working entry: a portable or test copy must not take it over.
+        assert!(!needs_repair(r"C:\Programs\Volume11\Volume11.exe", true));
+        // Nothing usable stored: leave it.
+        assert!(!needs_repair("  ", false));
     }
 
     #[test]

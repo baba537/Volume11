@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use egui::{Align, Color32, FontId, Layout, RichText, Sense, Vec2, ViewportCommand};
 
 use crate::audio::{
-    AudioHandle, Command, Event, MASTER_KEY, SYSTEM_KEY, SessionKind, SessionSnapshot,
+    AudioHandle, Command, DeviceInfo, Event, MASTER_KEY, SYSTEM_KEY, SessionKind, SessionSnapshot,
 };
 use crate::autostart;
 use crate::config::{Config, UnknownAppPolicy};
@@ -23,7 +23,10 @@ use crate::tray::TrayMessage;
 use appicon::IconCache;
 use icons::Icon;
 use theme::{ACCENT_CHOICES, CONTENT_MARGIN, Palette, accent_to_hex, parse_accent};
-use widgets::{chip_button, colour_swatch, icon_button, number_field, volume_slider};
+use widgets::{
+    chip_button, colour_swatch, device_option, device_selector, icon_button, number_field,
+    volume_slider,
+};
 
 pub const WINDOW_WIDTH: f32 = 424.0;
 pub const WINDOW_HEIGHT: f32 = 572.0;
@@ -59,6 +62,13 @@ pub struct VolumeApp {
 
     sessions: Vec<SessionSnapshot>,
     device_name: String,
+    /// Endpoint id of the current default device; the key into the per-device
+    /// saved levels. Empty until the audio engine has reported it.
+    device_id: String,
+    /// Active playback devices that can be switched to.
+    devices: Vec<DeviceInfo>,
+    /// Whether the device list under the header is unfolded.
+    device_menu_open: bool,
 
     view: View,
     palette: Palette,
@@ -100,6 +110,9 @@ impl VolumeApp {
             config_path,
             sessions: Vec::new(),
             device_name: String::new(),
+            device_id: String::new(),
+            devices: Vec::new(),
+            device_menu_open: false,
             view: View::Mixer,
             palette,
             visible: false,
@@ -229,9 +242,31 @@ impl VolumeApp {
                         session.muted = muted;
                     }
                 }
-                Event::DeviceChanged(name) => {
+                Event::DeviceChanged { id, name } => {
                     self.set_status(name.clone());
                     self.device_name = name;
+                    self.device_id = id;
+                    self.adopt_legacy_levels();
+
+                    // Each device has its own saved levels. Windows keeps
+                    // per-program volume per device too, so after a switch the
+                    // new device's levels are applied to everything playing.
+                    if self.config.settings.auto_apply {
+                        let entries = self.config.apply_list(&self.device_id);
+                        if !entries.is_empty() {
+                            self.audio.send(Command::ApplyAll(entries));
+                        }
+                    }
+                }
+                Event::Devices { list, current } => {
+                    if self.device_id.is_empty() {
+                        self.device_id = current;
+                        if let Some(device) = list.iter().find(|d| d.id == self.device_id) {
+                            self.device_name = device.name.clone();
+                        }
+                        self.adopt_legacy_levels();
+                    }
+                    self.devices = list;
                 }
                 Event::SessionAdded { key, label } => self.apply_on_start(&key, &label),
                 Event::Fatal(message) => self.fatal = Some(message),
@@ -246,7 +281,7 @@ impl VolumeApp {
             return;
         }
 
-        if let Some(entry) = self.config.get(key) {
+        if let Some(entry) = self.config.get(&self.device_id, key) {
             self.audio.send(Command::SetVolume {
                 key: key.to_string(),
                 volume: entry.volume,
@@ -266,22 +301,45 @@ impl VolumeApp {
         }
     }
 
-    /// Store the current levels of everything on screen.
+    /// Store the current levels of everything on screen, for the current device.
     fn save_current(&mut self) {
-        for session in &self.sessions {
-            self.config
-                .set(&session.key, session.volume, session.muted, &session.label);
+        if self.device_id.is_empty() {
+            return;
         }
 
+        for session in &self.sessions {
+            self.config.set(
+                &self.device_id,
+                &self.device_name,
+                &session.key,
+                session.volume,
+                session.muted,
+                &session.label,
+            );
+        }
+
+        let count = self
+            .config
+            .device(&self.device_id)
+            .map_or(0, |entry| entry.apps.len());
+
         match self.config.save(&self.config_path) {
-            Ok(()) => self.set_status(format!("{} saved", self.config.apps.len())),
+            Ok(()) => self.set_status(format!("{count} saved")),
             Err(error) => self.set_status(format!("Error: {error}")),
+        }
+    }
+
+    /// Move levels saved by version 1 onto the device in use now, once.
+    fn adopt_legacy_levels(&mut self) {
+        let (id, name) = (self.device_id.clone(), self.device_name.clone());
+        if self.config.adopt_legacy(&id, &name) {
+            self.persist_settings();
         }
     }
 
     /// Push the saved levels back onto whatever is currently playing.
     fn sync_saved(&mut self) {
-        let entries = self.config.as_apply_list();
+        let entries = self.config.apply_list(&self.device_id);
         let count = entries.len();
         self.audio.send(Command::ApplyAll(entries));
         self.set_status(format!("{count} applied"));
@@ -468,19 +526,55 @@ impl VolumeApp {
         }
 
         if self.view == View::Mixer && !self.device_name.is_empty() {
-            // Device names run long ("Headset Earphone (CORSAIR HS80 RGB Wireless
-            // Gaming Headset)"), so this ends in an ellipsis rather than being
-            // clipped by the window edge. The full name is in the tooltip.
-            ui.add(
-                egui::Label::new(
-                    RichText::new(&self.device_name)
-                        .size(12.5)
-                        .color(self.palette.text_dim),
-                )
-                .truncate(),
-            )
-            .on_hover_text(&self.device_name);
+            self.device_picker(ui);
         }
+    }
+
+    /// Current output device, unfolding into a list of the others.
+    ///
+    /// Picking one makes it the Windows default for every role. The engine then
+    /// sees the change like any other and reports back, which is where the new
+    /// device's saved levels get applied.
+    fn device_picker(&mut self, ui: &mut egui::Ui) {
+        let palette = self.palette;
+        let switchable = self.devices.len() > 1;
+
+        let selector = device_selector(
+            ui,
+            &self.device_name,
+            self.device_menu_open,
+            switchable,
+            &palette,
+        )
+        .on_hover_text(&self.device_name);
+
+        if switchable && selector.clicked() {
+            self.device_menu_open = !self.device_menu_open;
+        }
+
+        if !(switchable && self.device_menu_open) {
+            return;
+        }
+
+        let mut chosen: Option<String> = None;
+
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(0, 2))
+            .show(ui, |ui| {
+                for device in &self.devices {
+                    let current = device.id == self.device_id;
+                    if device_option(ui, &device.name, current, &palette).clicked() && !current {
+                        chosen = Some(device.id.clone());
+                    }
+                }
+            });
+
+        if let Some(id) = chosen {
+            self.audio.send(Command::SetDefaultDevice(id));
+            self.device_menu_open = false;
+        }
+
+        ui.add_space(4.0);
     }
 
     fn mixer(&mut self, ui: &mut egui::Ui) {
@@ -812,12 +906,29 @@ impl VolumeApp {
                 }
 
                 ui.add_space(10.0);
-                self.section(ui, format!("Saved ({})", self.config.apps.len()));
+
+                // Saved levels belong to a device, so the list shows the current
+                // device's set and names it.
+                let saved = self
+                    .config
+                    .device(&self.device_id)
+                    .map(|entry| entry.apps.clone())
+                    .unwrap_or_default();
+
+                self.section(ui, format!("Saved ({})", saved.len()));
+                if !self.device_name.is_empty() {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&self.device_name)
+                                .size(12.5)
+                                .color(self.palette.text_dim),
+                        )
+                        .truncate(),
+                    );
+                }
 
                 let mut remove: Option<String> = None;
-                let entries: Vec<(String, String, u8, bool)> = self
-                    .config
-                    .apps
+                let entries: Vec<(String, String, u8, bool)> = saved
                     .iter()
                     .map(|(key, entry)| {
                         (
@@ -873,7 +984,7 @@ impl VolumeApp {
                 }
 
                 if let Some(key) = remove {
-                    self.config.remove(&key);
+                    self.config.remove(&self.device_id, &key);
                     changed = true;
                 }
 

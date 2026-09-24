@@ -59,6 +59,10 @@ fn main() -> eframe::Result<()> {
     let config_path = config::config_path();
     let mut loaded = Config::load(&config_path);
 
+    // An autostart entry written by a copy that has since moved would start a
+    // file that no longer exists. Repoint it before reading its state.
+    autostart::repair();
+
     // The registry is the source of truth for autostart: the user may have removed
     // the entry through Task Manager since the last run.
     loaded.settings.start_with_windows = autostart::is_enabled();

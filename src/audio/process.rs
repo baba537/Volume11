@@ -166,18 +166,39 @@ pub fn file_description(executable_path: &str) -> Option<String> {
             return None;
         }
 
-        // value_len counts characters and includes the trailing NUL.
+        // `value_len` is documented to count characters including the NUL, but
+        // not every executable's resource agrees: Spotify's reports a length
+        // that runs past its description into the next entry, which showed up
+        // as "Spotify8?FileV". The string ends at the first NUL, whatever the
+        // length claims.
         let chars = std::slice::from_raw_parts(value as *const u16, value_len as usize);
-        let text = String::from_utf16_lossy(chars);
-        let text = text.trim_end_matches('\0').trim();
-
-        (!text.is_empty()).then(|| text.to_string())
+        Some(clean_description(chars)).filter(|text| !text.is_empty())
     }
+}
+
+/// A UTF-16 resource string cut at its first NUL, with surrounding space removed.
+fn clean_description(chars: &[u16]) -> String {
+    let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+    String::from_utf16_lossy(&chars[..end]).trim().to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn description_stops_at_the_first_nul() {
+        // What Spotify's version resource hands back: the name, a terminator,
+        // then the start of the next entry.
+        let raw: Vec<u16> = "Spotify\0\u{8}\u{1}FileVersion".encode_utf16().collect();
+        assert_eq!(clean_description(&raw), "Spotify");
+
+        let padded: Vec<u16> = " Firefox \0".encode_utf16().collect();
+        assert_eq!(clean_description(&padded), "Firefox");
+
+        let unterminated: Vec<u16> = "Steam".encode_utf16().collect();
+        assert_eq!(clean_description(&unterminated), "Steam");
+    }
 
     #[test]
     fn friendly_label_strips_extension_and_capitalizes() {
@@ -204,5 +225,19 @@ mod tests {
         let pid = std::process::id();
         let name = executable_name(pid).expect("own process must resolve");
         assert!(name.ends_with(".exe"), "unexpected name: {name}");
+    }
+}
+
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    /// Prints the description read from a real executable. Ignored by default;
+    /// run with `VOLUME11_DESCRIBE=<path> cargo test describe -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn describe() {
+        let path = std::env::var("VOLUME11_DESCRIBE").expect("set VOLUME11_DESCRIBE");
+        println!("description: {:?}", file_description(&path));
     }
 }

@@ -2,6 +2,22 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.2.0 — 2026-09-24
+
+### Added
+- Output device switcher: click the device name above the mixer. Each device
+  keeps its own saved levels, and switching applies that device's set.
+
+### Changed
+- Configuration format 2 stores levels per device. Levels saved by 0.1.0 move
+  to the device in use at the first start.
+
+### Fixed
+- An autostart entry pointing at a deleted copy of Volume11 is repointed at the
+  running one. The installer also adopts an existing entry.
+- Program names read from an executable's version resource could end in
+  garbage, e.g. "Spotify8?FileV".
+
 ## 0.1.0 — 2026-09-21
 
 First release.

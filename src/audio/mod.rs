@@ -13,9 +13,11 @@
 
 mod callbacks;
 mod engine;
+mod policy;
 pub mod process;
 
 pub use engine::{AudioHandle, spawn};
+pub use policy::set_default_device;
 
 /// Identity of the master (endpoint) volume in configuration and commands.
 pub const MASTER_KEY: &str = "@master";
@@ -56,6 +58,15 @@ pub struct SessionSnapshot {
     pub executable: Option<String>,
 }
 
+/// An active playback device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfo {
+    /// Endpoint id. Stable across restarts and reboots for the same hardware,
+    /// which is what makes it usable as the key for per-device saved volumes.
+    pub id: String,
+    pub name: String,
+}
+
 /// Sent from the UI to the audio thread.
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -71,6 +82,8 @@ pub enum Command {
     ApplyAll(Vec<(String, u8, bool)>),
     /// Re-enumerate sessions from scratch.
     Refresh,
+    /// Make this endpoint the Windows default playback device.
+    SetDefaultDevice(String),
     Shutdown,
 }
 
@@ -85,8 +98,14 @@ pub enum Event {
         volume: u8,
         muted: bool,
     },
-    /// The default playback device changed. Carries its friendly name.
-    DeviceChanged(String),
+    /// The default playback device changed.
+    DeviceChanged { id: String, name: String },
+    /// The playback devices that can be switched to, and which one is current.
+    /// Sent at startup and whenever a device is plugged in, removed or enabled.
+    Devices {
+        list: Vec<DeviceInfo>,
+        current: String,
+    },
     /// A session that was not present before appeared. Sent only for genuinely
     /// new sessions, so re-applying saved levels cannot clobber adjustments the
     /// user made by hand during this run.
